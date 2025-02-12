@@ -646,6 +646,8 @@ func (r *Rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok b
 		precision = int64((mod >> 16) & 0xffff)
 		scale = int64(mod & 0xffff)
 		return precision, scale, true
+	case pgtype.TimestamptzOID, pgtype.TimestampOID:
+		return 0, int64(fd.TypeModifier), true
 	default:
 		return 0, 0, false
 	}
