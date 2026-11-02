@@ -3,7 +3,11 @@ package pgx_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"io"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -11,7 +15,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/internal/faultyconn"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxtest"
 	"github.com/stretchr/testify/assert"
@@ -390,8 +396,7 @@ func TestExecPerQuerySimpleProtocol(t *testing.T) {
 	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer closeConn(t, conn)
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	defer cancelFunc()
+	ctx := t.Context()
 
 	commandTag, err := conn.Exec(ctx, "create temporary table foo(name varchar primary key);")
 	if err != nil {
@@ -412,7 +417,6 @@ func TestExecPerQuerySimpleProtocol(t *testing.T) {
 	if commandTag.String() != "INSERT 0 1" {
 		t.Fatalf("Unexpected results from Exec: %v", commandTag)
 	}
-
 }
 
 func TestPrepare(t *testing.T) {
@@ -467,6 +471,192 @@ func TestPrepare(t *testing.T) {
 	}
 }
 
+// https://github.com/jackc/pgx/issues/2223
+func TestPrepareHandlesTimeoutBetweenParseAndDescribe(t *testing.T) {
+	// Not parallel because it is a timing sensitive test.
+
+	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	var faultyConn *faultyconn.Conn
+	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+		faultyConn = faultyconn.New(conn)
+		return faultyConn, nil
+	}
+
+	ctx := context.Background()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer closeConn(t, conn)
+	require.NotNil(t, faultyConn)
+
+	pgxtest.SkipCockroachDB(t, conn, "Induced error does not occur on CockroachDB")
+
+	_, err = conn.Exec(ctx, "set statement_timeout = '100ms'")
+	require.NoError(t, err)
+
+	faultyConn.HandleFrontendMessage = func(backendWriter io.Writer, msg pgproto3.FrontendMessage) error {
+		if _, ok := msg.(*pgproto3.Describe); ok {
+			time.Sleep(200 * time.Millisecond)
+		}
+		buf, err := msg.Encode(nil)
+		if err != nil {
+			return err
+		}
+		_, err = backendWriter.Write(buf)
+		return err
+	}
+
+	psd, err := conn.Prepare(ctx, "test", "select $1::varchar")
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "57014", pgErr.Code)
+	require.Nil(t, psd)
+
+	faultyConn.HandleFrontendMessage = nil
+
+	_, err = conn.Exec(ctx, "set statement_timeout = default")
+	require.NoError(t, err)
+
+	var existsOnServer bool
+	err = conn.QueryRow(
+		ctx,
+		"select exists(select 1 from pg_prepared_statements where name = 'test')",
+		// Avoid using the prepared statement cache or it will clear the broken statement before we can check for its
+		// existence.
+		pgx.QueryExecModeExec,
+	).Scan(&existsOnServer)
+	require.NoError(t, err)
+	require.True(t, existsOnServer)
+
+	psd, err = conn.Prepare(ctx, "test", "select $1::varchar")
+	require.NoError(t, err)
+	require.NotNil(t, psd)
+}
+
+// https://github.com/jackc/pgx/issues/2640
+func TestPrepareWithDigestedNameHandlesTimeoutBetweenParseAndDescribe(t *testing.T) {
+	// Not parallel because it is a timing sensitive test.
+	//
+	// stdlib (and therefore database/sql) calls Prepare(ctx, sql, sql). In that case the statement is prepared on the
+	// server under stmt_<digest> while the client keys it by the SQL text. Cleanup after a Describe phase failure must
+	// deallocate the digest name — deallocating by the SQL text closes a nonexistent statement, so the leaked
+	// statement stays on the server and re-preparing the same SQL fails with 42P05 for the rest of the connection's
+	// life.
+
+	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	var faultyConn *faultyconn.Conn
+	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+		faultyConn = faultyconn.New(conn)
+		return faultyConn, nil
+	}
+
+	ctx := context.Background()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer closeConn(t, conn)
+	require.NotNil(t, faultyConn)
+
+	pgxtest.SkipCockroachDB(t, conn, "Induced error does not occur on CockroachDB")
+
+	_, err = conn.Exec(ctx, "set statement_timeout = '100ms'")
+	require.NoError(t, err)
+
+	faultyConn.HandleFrontendMessage = func(backendWriter io.Writer, msg pgproto3.FrontendMessage) error {
+		if _, ok := msg.(*pgproto3.Describe); ok {
+			time.Sleep(200 * time.Millisecond)
+		}
+		buf, err := msg.Encode(nil)
+		if err != nil {
+			return err
+		}
+		_, err = backendWriter.Write(buf)
+		return err
+	}
+
+	sql := "select $1::varchar"
+	digest := sha256.Sum256([]byte(sql))
+	psName := "stmt_" + hex.EncodeToString(digest[0:24])
+
+	psd, err := conn.Prepare(ctx, sql, sql)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "57014", pgErr.Code)
+	require.Nil(t, psd)
+
+	faultyConn.HandleFrontendMessage = nil
+
+	_, err = conn.Exec(ctx, "set statement_timeout = default")
+	require.NoError(t, err)
+
+	var existsOnServer bool
+	err = conn.QueryRow(
+		ctx,
+		"select exists(select 1 from pg_prepared_statements where name = $1)",
+		// Avoid using the prepared statement cache or it will clear the broken statement before we can check for its
+		// existence.
+		pgx.QueryExecModeExec,
+		psName,
+	).Scan(&existsOnServer)
+	require.NoError(t, err)
+	require.True(t, existsOnServer)
+
+	psd, err = conn.Prepare(ctx, sql, sql)
+	require.NoError(t, err)
+	require.NotNil(t, psd)
+}
+
+// https://github.com/jackc/pgx/issues/2640
+func TestPrepareFailedParseSchedulesNoCleanup(t *testing.T) {
+	t.Parallel()
+
+	// A Prepare that fails before Parse completes leaves no statement on the server, so the next Prepare must not
+	// spend a round trip deallocating anything.
+
+	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	var faultyConn *faultyconn.Conn
+	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+		faultyConn = faultyconn.New(conn)
+		return faultyConn, nil
+	}
+
+	ctx := context.Background()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer closeConn(t, conn)
+	require.NotNil(t, faultyConn)
+
+	sql := "select foo"
+	psd, err := conn.Prepare(ctx, sql, sql)
+	require.Error(t, err)
+	require.Nil(t, psd)
+	var pErr *pgconn.PrepareError
+	require.ErrorAs(t, err, &pErr)
+	require.False(t, pErr.ParseComplete)
+
+	var sentClose bool
+	faultyConn.HandleFrontendMessage = func(backendWriter io.Writer, msg pgproto3.FrontendMessage) error {
+		if _, ok := msg.(*pgproto3.Close); ok {
+			sentClose = true
+		}
+		buf, err := msg.Encode(nil)
+		if err != nil {
+			return err
+		}
+		_, err = backendWriter.Write(buf)
+		return err
+	}
+
+	psd, err = conn.Prepare(ctx, "select 1", "select 1")
+	require.NoError(t, err)
+	require.NotNil(t, psd)
+	require.False(t, sentClose)
+}
+
 func TestPrepareBadSQLFailure(t *testing.T) {
 	t.Parallel()
 
@@ -487,7 +677,7 @@ func TestPrepareIdempotency(t *testing.T) {
 	defer cancel()
 
 	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			_, err := conn.Prepare(context.Background(), "test", "select 42::integer")
 			if err != nil {
 				t.Fatalf("%d. Unable to prepare statement: %v", i, err)
@@ -684,7 +874,7 @@ func TestListenNotifyWhileBusyIsSafe(t *testing.T) {
 		mustExec(t, conn, "listen busysafe")
 		listening <- true
 
-		for i := 0; i < 5000; i++ {
+		for range 5000 {
 			var sum int32
 			var rowCount int32
 
@@ -730,7 +920,7 @@ func TestListenNotifyWhileBusyIsSafe(t *testing.T) {
 
 		<-listening
 
-		for i := 0; i < 100000; i++ {
+		for range 100_000 {
 			mustExec(t, conn, "notify busysafe, 'hello'")
 		}
 	}()
@@ -783,9 +973,7 @@ func TestFatalRxError(t *testing.T) {
 	pgxtest.SkipCockroachDB(t, conn, "Server does not support pg_terminate_backend() (https://github.com/cockroachdb/cockroach/issues/35897)")
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		var n int32
 		var s string
 		err := conn.QueryRow(context.Background(), "select 1::int4, pg_sleep(10)::varchar").Scan(&n, &s)
@@ -794,7 +982,7 @@ func TestFatalRxError(t *testing.T) {
 			t.Errorf("Expected QueryRow Scan to return fatal PgError, but instead received %v", err)
 			return
 		}
-	}()
+	})
 
 	otherConn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer otherConn.Close(context.Background())
@@ -814,7 +1002,7 @@ func TestFatalTxError(t *testing.T) {
 	t.Parallel()
 
 	// Run timing sensitive test many times
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		func() {
 			conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 			defer closeConn(t, conn)
@@ -1047,6 +1235,19 @@ create type pgx_b.point as (c text);
 	})
 }
 
+func TestLoadTypeLoadsArrayDelimiter(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does not support box type")
+
+		dt, err := conn.LoadType(ctx, "_box")
+		require.NoError(t, err)
+
+		codec, ok := dt.Codec.(*pgtype.ArrayCodec)
+		require.True(t, ok)
+		require.Equal(t, byte(';'), codec.Delimiter)
+	})
+}
+
 func TestLoadCompositeType(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -1089,7 +1290,7 @@ func TestLoadRangeType(t *testing.T) {
 		conn.TypeMap().RegisterType(newRangeType)
 		conn.TypeMap().RegisterDefaultPgType(pgtype.Range[float64]{}, "examplefloatrange")
 
-		var inputRangeType = pgtype.Range[float64]{
+		inputRangeType := pgtype.Range[float64]{
 			Lower:     1.0,
 			Upper:     2.0,
 			LowerType: pgtype.Inclusive,
@@ -1129,7 +1330,7 @@ func TestLoadMultiRangeType(t *testing.T) {
 		conn.TypeMap().RegisterType(newMultiRangeType)
 		conn.TypeMap().RegisterDefaultPgType(pgtype.Multirange[pgtype.Range[float64]]{}, "examplefloatmultirange")
 
-		var inputMultiRangeType = pgtype.Multirange[pgtype.Range[float64]]{
+		inputMultiRangeType := pgtype.Multirange[pgtype.Range[float64]]{
 			{
 				Lower:     1.0,
 				Upper:     2.0,
@@ -1187,7 +1388,7 @@ func TestStmtCacheInvalidationConn(t *testing.T) {
 	// It is up to the application to determine if it wants to try again. We punt to
 	// the application because there is no clear recovery path in the case of failed transactions
 	// or batch operations and because automatic retry is tricky and we don't want to get
-	// it wrong at such an importaint layer of the stack.
+	// it wrong at such an important layer of the stack.
 	rows, err = conn.Query(ctx, getSQL, 1)
 	require.NoError(t, err)
 	rows.Next()
@@ -1256,7 +1457,7 @@ func TestStmtCacheInvalidationTx(t *testing.T) {
 	// It is up to the application to determine if it wants to try again. We punt to
 	// the application because there is no clear recovery path in the case of failed transactions
 	// or batch operations and because automatic retry is tricky and we don't want to get
-	// it wrong at such an importaint layer of the stack.
+	// it wrong at such an important layer of the stack.
 	rows, err = tx.Query(ctx, getSQL, 1)
 	require.NoError(t, err)
 	rows.Next()
@@ -1293,6 +1494,223 @@ func TestStmtCacheInvalidationTx(t *testing.T) {
 	ensureConnValid(t, conn)
 }
 
+func TestStmtCacheInvalidationConnWithBatch(t *testing.T) {
+	ctx := context.Background()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	if conn.PgConn().ParameterStatus("crdb_version") != "" {
+		t.Skip("Test fails due to different CRDB behavior")
+	}
+
+	// create a table and fill it with some data
+	_, err := conn.Exec(ctx, `
+        DROP TABLE IF EXISTS drop_cols;
+        CREATE TABLE drop_cols (
+            id SERIAL PRIMARY KEY NOT NULL,
+            f1 int NOT NULL,
+            f2 int NOT NULL
+        );
+    `)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "INSERT INTO drop_cols (f1, f2) VALUES (1, 2)")
+	require.NoError(t, err)
+
+	getSQL := "SELECT * FROM drop_cols WHERE id = $1"
+
+	// This query will populate the statement cache. We don't care about the result.
+	rows, err := conn.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Close()
+	require.NoError(t, rows.Err())
+
+	// Now, change the schema of the table out from under the statement, making it invalid.
+	_, err = conn.Exec(ctx, "ALTER TABLE drop_cols DROP COLUMN f1")
+	require.NoError(t, err)
+
+	// We must get an error the first time we try to re-execute a bad statement.
+	// It is up to the application to determine if it wants to try again. We punt to
+	// the application because there is no clear recovery path in the case of failed transactions
+	// or batch operations and because automatic retry is tricky and we don't want to get
+	// it wrong at such an important layer of the stack.
+	batch := &pgx.Batch{}
+	batch.Queue(getSQL, 1)
+	br := conn.SendBatch(ctx, batch)
+	rows, err = br.Query()
+	require.Error(t, err)
+	rows.Next()
+	nextErr := rows.Err()
+	rows.Close()
+	err = br.Close()
+	require.Error(t, err)
+	for _, err := range []error{nextErr, rows.Err()} {
+		if err == nil {
+			t.Fatal(`expected "cached plan must not change result type": no error`)
+		}
+		if !strings.Contains(err.Error(), "cached plan must not change result type") {
+			t.Fatalf(`expected "cached plan must not change result type", got: "%s"`, err.Error())
+		}
+	}
+
+	// On retry, the statement should have been flushed from the cache.
+	batch = &pgx.Batch{}
+	batch.Queue(getSQL, 1)
+	br = conn.SendBatch(ctx, batch)
+	rows, err = br.Query()
+	require.NoError(t, err)
+	rows.Next()
+	err = rows.Err()
+	require.NoError(t, err)
+	rows.Close()
+	require.NoError(t, rows.Err())
+	err = br.Close()
+	require.NoError(t, err)
+
+	ensureConnValid(t, conn)
+}
+
+func TestStmtCacheInvalidationTxWithBatch(t *testing.T) {
+	ctx := context.Background()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	if conn.PgConn().ParameterStatus("crdb_version") != "" {
+		t.Skip("Server has non-standard prepare in errored transaction behavior (https://github.com/cockroachdb/cockroach/issues/84140)")
+	}
+
+	// create a table and fill it with some data
+	_, err := conn.Exec(ctx, `
+        DROP TABLE IF EXISTS drop_cols;
+        CREATE TABLE drop_cols (
+            id SERIAL PRIMARY KEY NOT NULL,
+            f1 int NOT NULL,
+            f2 int NOT NULL
+        );
+    `)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "INSERT INTO drop_cols (f1, f2) VALUES (1, 2)")
+	require.NoError(t, err)
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+
+	getSQL := "SELECT * FROM drop_cols WHERE id = $1"
+
+	// This query will populate the statement cache. We don't care about the result.
+	rows, err := tx.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Close()
+	require.NoError(t, rows.Err())
+
+	// Now, change the schema of the table out from under the statement, making it invalid.
+	_, err = tx.Exec(ctx, "ALTER TABLE drop_cols DROP COLUMN f1")
+	require.NoError(t, err)
+
+	// We must get an error the first time we try to re-execute a bad statement.
+	// It is up to the application to determine if it wants to try again. We punt to
+	// the application because there is no clear recovery path in the case of failed transactions
+	// or batch operations and because automatic retry is tricky and we don't want to get
+	// it wrong at such an important layer of the stack.
+	batch := &pgx.Batch{}
+	batch.Queue(getSQL, 1)
+	br := tx.SendBatch(ctx, batch)
+	rows, err = br.Query()
+	require.Error(t, err)
+	rows.Next()
+	nextErr := rows.Err()
+	rows.Close()
+	err = br.Close()
+	require.Error(t, err)
+	for _, err := range []error{nextErr, rows.Err()} {
+		if err == nil {
+			t.Fatal(`expected "cached plan must not change result type": no error`)
+		}
+		if !strings.Contains(err.Error(), "cached plan must not change result type") {
+			t.Fatalf(`expected "cached plan must not change result type", got: "%s"`, err.Error())
+		}
+	}
+
+	batch = &pgx.Batch{}
+	batch.Queue(getSQL, 1)
+	br = tx.SendBatch(ctx, batch)
+	rows, err = br.Query()
+	require.Error(t, err)
+	rows.Close()
+	err = rows.Err()
+	// Retries within the same transaction are errors (really anything except a rollback
+	// will be an error in this transaction).
+	require.Error(t, err)
+	rows.Close()
+	err = br.Close()
+	require.Error(t, err)
+
+	err = tx.Rollback(ctx)
+	require.NoError(t, err)
+
+	// once we've rolled back, retries will work
+	batch = &pgx.Batch{}
+	batch.Queue(getSQL, 1)
+	br = conn.SendBatch(ctx, batch)
+	rows, err = br.Query()
+	require.NoError(t, err)
+	rows.Next()
+	err = rows.Err()
+	require.NoError(t, err)
+	rows.Close()
+	err = br.Close()
+	require.NoError(t, err)
+
+	ensureConnValid(t, conn)
+}
+
+// https://github.com/jackc/pgx/issues/2442
+func TestStmtCacheInvalidationExec(t *testing.T) {
+	ctx := context.Background()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	if conn.PgConn().ParameterStatus("crdb_version") != "" {
+		t.Skip("CockroachDB does not support column column type from int to bool")
+	}
+
+	// create a table and fill it with some data
+	_, err := conn.Exec(ctx, `
+				DROP TABLE IF EXISTS drop_cols;
+        CREATE TABLE drop_cols (
+            id SERIAL PRIMARY KEY NOT NULL,
+            f1 int NOT NULL,
+            f2 int NOT NULL
+        );
+    `)
+	require.NoError(t, err)
+
+	insertSQL := "INSERT INTO drop_cols (f1, f2) VALUES ($1, $2)"
+	// This query will populate the statement cache.
+	_, err = conn.Exec(ctx, insertSQL, 1, 2)
+	require.NoError(t, err)
+
+	// Now, change the schema of the table out from under the statement, making it invalid.
+	_, err = conn.Exec(ctx, "ALTER TABLE drop_cols ALTER COLUMN f1 TYPE boolean USING f1::boolean")
+	require.NoError(t, err)
+
+	// We must get an error the first time we try to re-execute a bad statement.
+	// It is up to the application to determine if it wants to try again. We punt to
+	// the application because there is no clear recovery path in the case of failed transactions
+	// or batch operations and because automatic retry is tricky and we don't want to get
+	// it wrong at such an important layer of the stack.
+	_, err = conn.Exec(ctx, insertSQL, true, 2)
+	require.ErrorContains(t, err, "failed to encode args[0]")
+
+	// On retry, the statement should have been flushed from the cache.
+	_, err = conn.Exec(ctx, insertSQL, true, 2)
+	require.NoError(t, err)
+
+	ensureConnValid(t, conn)
+}
+
 func TestInsertDurationInterval(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -1325,7 +1743,7 @@ func TestRawValuesUnderlyingMemoryReused(t *testing.T) {
 		original := make([]byte, len(buf))
 		copy(original, buf)
 
-		for i := 0; i < 1_000_000; i++ {
+		for i := range 1_000_000 {
 			rows, err := conn.Query(ctx, `select $1::int`, i)
 			require.NoError(t, err)
 			rows.Close()

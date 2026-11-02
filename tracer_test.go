@@ -2,10 +2,14 @@ package pgx_test
 
 import (
 	"context"
+	"net"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/internal/faultyconn"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxtest"
 	"github.com/stretchr/testify/require"
 )
@@ -119,13 +123,13 @@ func TestTraceExec(t *testing.T) {
 			require.Equal(t, `select $1::text`, data.SQL)
 			require.Len(t, data.Args, 1)
 			require.Equal(t, `testing`, data.Args[0])
-			return context.WithValue(ctx, ctxKey(ctxKey("fromTraceQueryStart")), "foo")
+			return context.WithValue(ctx, ctxKey("fromTraceQueryStart"), "foo")
 		}
 
 		traceQueryEndCalled := false
 		tracer.traceQueryEnd = func(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
 			traceQueryEndCalled = true
-			require.Equal(t, "foo", ctx.Value(ctxKey(ctxKey("fromTraceQueryStart"))))
+			require.Equal(t, "foo", ctx.Value(ctxKey("fromTraceQueryStart")))
 			require.Equal(t, `SELECT 1`, data.CommandTag.String())
 			require.NoError(t, data.Err)
 		}
@@ -418,6 +422,168 @@ func TestTraceBatchErrorWhileReadingResultsWhileClosing(t *testing.T) {
 	})
 }
 
+// TestTraceBatchQueryReadStartTime checks that each result's timestamp excludes pauses before requesting it and
+// includes pauses while its Rows remains open, across all execution modes and consumption paths.
+func TestTraceBatchQueryReadStartTime(t *testing.T) {
+	t.Parallel()
+
+	tracer := &testTracer{}
+
+	ctr := defaultConnTestRunner
+	ctr.CreateConfig = func(ctx context.Context, t testing.TB) *pgx.ConnConfig {
+		config := defaultConnTestRunner.CreateConfig(ctx, t)
+		config.Tracer = tracer
+		return config
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, ctr, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		var readStartTimes []time.Time
+		tracer.traceBatchQuery = func(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchQueryData) {
+			require.NoError(t, data.Err)
+			require.Falsef(t, data.ReadStartTime.IsZero(), "ReadStartTime must be populated")
+			readStartTimes = append(readStartTimes, data.ReadStartTime)
+		}
+		assertReadStartTime := func(index int, beforeRead, afterRead time.Time) {
+			t.Helper()
+			require.Falsef(t, readStartTimes[index].Before(beforeRead),
+				"query %d: ReadStartTime must exclude the pause before requesting the result", index)
+			require.Falsef(t, readStartTimes[index].After(afterRead),
+				"query %d: ReadStartTime must be captured before the result request returns", index)
+		}
+
+		batch := &pgx.Batch{}
+		batch.Queue(`select 1`)
+		batch.Queue(`select 2`)
+		batch.Queue(`select 3`)
+		batch.Queue(`select 4`)
+
+		br := conn.SendBatch(ctx, batch)
+		defer br.Close()
+
+		time.Sleep(5 * time.Millisecond)
+
+		// Exec consumes the first query immediately; TraceBatchQuery fires before Exec returns.
+		beforeRead := time.Now()
+		_, err := br.Exec()
+		afterRead := time.Now()
+		require.NoError(t, err)
+		require.Len(t, readStartTimes, 1)
+		assertReadStartTime(0, beforeRead, afterRead)
+
+		time.Sleep(5 * time.Millisecond)
+
+		// QueryRow starts reading before Scan; the interval must include a pause before Scan closes the Rows.
+		beforeRead = time.Now()
+		row := br.QueryRow()
+		afterRead = time.Now()
+		require.Len(t, readStartTimes, 1)
+		time.Sleep(5 * time.Millisecond)
+		var n int32
+		err = row.Scan(&n)
+		require.NoError(t, err)
+		require.EqualValues(t, 2, n)
+		require.Len(t, readStartTimes, 2)
+		assertReadStartTime(1, beforeRead, afterRead)
+
+		time.Sleep(5 * time.Millisecond)
+
+		// Query defers TraceBatchQuery until the returned Rows is closed: reading the row and pausing before Close
+		// must not produce a trace yet, even though pgx already began reading the third query's result.
+		beforeRead = time.Now()
+		rows, err := br.Query()
+		afterRead = time.Now()
+		require.NoError(t, err)
+		require.True(t, rows.Next())
+		require.NoError(t, rows.Scan(&n))
+		require.EqualValues(t, 3, n)
+		// Deliberately do not drain to exhaustion (which would auto-close Rows); leave Rows open and pause, as an
+		// application processing a row would, then close explicitly.
+		require.Len(t, readStartTimes, 2, "TraceBatchQuery must not fire until Rows is closed")
+
+		time.Sleep(5 * time.Millisecond)
+		rows.Close()
+		require.NoError(t, rows.Err())
+		require.Len(t, readStartTimes, 3)
+		assertReadStartTime(2, beforeRead, afterRead)
+
+		// Close requests and drains the remaining result, excluding the pause before Close.
+		time.Sleep(5 * time.Millisecond)
+		beforeRead = time.Now()
+		err = br.Close()
+		afterRead = time.Now()
+		require.NoError(t, err)
+		require.Len(t, readStartTimes, 4)
+		assertReadStartTime(3, beforeRead, afterRead)
+	})
+}
+
+// TestTraceBatchQueryTracesPipelineGetResultsError asserts that pipelineBatchResults.Exec emits TraceBatchQuery even
+// when the underlying pipeline.GetResults call itself fails -- e.g. because the context was canceled -- rather than
+// only when the query completes and returns a normal query error. Before this fix, that path returned silently
+// without ever calling TraceBatchQuery, leaving the query untraced.
+func TestTraceBatchQueryTracesPipelineGetResultsError(t *testing.T) {
+	// Not parallel because it deterministically kills the underlying connection.
+
+	tracer := &testTracer{}
+
+	var faultyConn *faultyconn.Conn
+	ctr := pgxtest.DefaultConnTestRunner()
+	ctr.CreateConfig = func(ctx context.Context, t testing.TB) *pgx.ConnConfig {
+		config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+		require.NoError(t, err)
+		config.Tracer = tracer
+		config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+			faultyConn = faultyconn.New(conn)
+			return faultyConn, nil
+		}
+		return config
+	}
+	// The test kills the connection deliberately, so a clean Close is not expected.
+	ctr.CloseConn = func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_ = conn.Close(ctx)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Only extended-protocol modes route through pipelineBatchResults; QueryExecModeExec and
+	// QueryExecModeSimpleProtocol use batchResults instead, which already traced this error before this fix.
+	pipelineModes := []pgx.QueryExecMode{
+		pgx.QueryExecModeCacheStatement,
+		pgx.QueryExecModeCacheDescribe,
+		pgx.QueryExecModeDescribeExec,
+	}
+
+	pgxtest.RunWithQueryExecModes(ctx, t, ctr, pipelineModes, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		traceBatchQueryCalledCount := 0
+		var lastErr error
+		tracer.traceBatchQuery = func(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchQueryData) {
+			traceBatchQueryCalledCount++
+			lastErr = data.Err
+		}
+
+		batch := &pgx.Batch{}
+		batch.Queue(`select 1`)
+
+		br := conn.SendBatch(context.Background(), batch)
+
+		// Kill the connection before GetResults is called, so it fails at the client level (a read/protocol error),
+		// not with a normal PgError -- deterministically reproducing the path pipelineBatchResults.Exec used to
+		// return from without ever calling TraceBatchQuery.
+		require.NoError(t, faultyConn.Close())
+
+		_, err := br.Exec()
+		require.Error(t, err)
+		require.EqualValues(t, 1, traceBatchQueryCalledCount, "TraceBatchQuery must fire even when GetResults itself fails")
+		require.Error(t, lastErr)
+
+		br.Close()
+	})
+}
+
 func TestTraceCopyFrom(t *testing.T) {
 	t.Parallel()
 
@@ -565,4 +731,44 @@ func TestTraceConnect(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, traceConnectStartCalled)
 	require.True(t, traceConnectEndCalled)
+}
+
+// Ensure tracer runs within a transaction.
+//
+// https://github.com/jackc/pgx/issues/2304
+func TestTraceWithinTx(t *testing.T) {
+	t.Parallel()
+
+	tracer := &testTracer{}
+
+	ctr := defaultConnTestRunner
+	ctr.CreateConfig = func(ctx context.Context, t testing.TB) *pgx.ConnConfig {
+		config := defaultConnTestRunner.CreateConfig(ctx, t)
+		config.Tracer = tracer
+		return config
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, ctr, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		var queries []string
+		tracer.traceQueryStart = func(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+			queries = append(queries, data.SQL)
+			return ctx
+		}
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, `select $1::text`, "testing")
+		require.NoError(t, err)
+		err = tx.Commit(ctx)
+		require.NoError(t, err)
+
+		require.Len(t, queries, 3)
+		require.Equal(t, `begin`, queries[0])
+		require.Equal(t, `select $1::text`, queries[1])
+		require.Equal(t, `commit`, queries[2])
+	})
 }

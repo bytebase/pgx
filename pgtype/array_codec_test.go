@@ -2,12 +2,13 @@ package pgtype_test
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/hex"
 	"reflect"
 	"strings"
 	"testing"
 
-	pgx "github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxtest"
 	"github.com/stretchr/testify/assert"
@@ -49,6 +50,179 @@ func TestArrayCodec(t *testing.T) {
 			assert.NoErrorf(t, err, "%d", i)
 			assert.Equalf(t, tt.expected, actual, "%d", i)
 		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]uint16(nil)},
+			{[]uint16{}},
+			{[]uint16{1, 2, 3}},
+		} {
+			var actual []uint16
+			err := conn.QueryRow(
+				ctx,
+				"select $1::smallint[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]uint32(nil)},
+			{[]uint32{}},
+			{[]uint32{1, 2, 3}},
+		} {
+			var actual []uint32
+			err := conn.QueryRow(
+				ctx,
+				"select $1::int[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]uint64(nil)},
+			{[]uint64{}},
+			{[]uint64{1, 2, 3}},
+		} {
+			var actual []uint64
+			err := conn.QueryRow(
+				ctx,
+				"select $1::bigint[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected []uint64
+		}{
+			{[]uint64(nil)},
+			{[]uint64{}},
+			{[]uint64{1, 2, 3}},
+		} {
+			var actual []uint64
+			err := conn.QueryRow(
+				ctx,
+				"select $1::int[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]uint(nil)},
+			{[]uint{}},
+			{[]uint{1, 2, 3}},
+		} {
+			var actual []uint
+			err := conn.QueryRow(
+				ctx,
+				"select $1::int[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]int(nil)},
+			{[]int{}},
+			{[]int{-1, 0, 1, 2, 3}},
+		} {
+			var actual []int
+			err := conn.QueryRow(
+				ctx,
+				"select $1::int[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]int8(nil)},
+			{[]int8{}},
+			{[]int8{-128, -1, 0, 1, 127}},
+		} {
+			var actual []int8
+			err := conn.QueryRow(
+				ctx,
+				"select $1::smallint[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[]bool(nil)},
+			{[]bool{}},
+			{[]bool{true, false, true}},
+		} {
+			var actual []bool
+			err := conn.QueryRow(
+				ctx,
+				"select $1::bool[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+
+		for i, tt := range []struct {
+			expected any
+		}{
+			{[][16]byte(nil)},
+			{[][16]byte{}},
+			{[][16]byte{
+				{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+				{15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0},
+			}},
+		} {
+			var actual [][16]byte
+			err := conn.QueryRow(
+				ctx,
+				"select $1::uuid[]",
+				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+	})
+}
+
+func TestOID8Array(t *testing.T) {
+	skipCockroachDB(t, "Server does not support oid8")
+	skipPostgreSQLVersionLessThan(t, 19)
+
+	max := uint64(1<<64 - 1)
+	zero := uint64(0)
+	values := []*uint64{&max, nil, &zero}
+	queryModes := []pgx.QueryExecMode{pgx.QueryExecModeDescribeExec, pgx.QueryExecModeSimpleProtocol}
+	pgxtest.RunValueRoundTripTests(context.Background(), t, defaultConnTestRunner, queryModes, "oid8[]", []pgxtest.ValueRoundTripTest{
+		{
+			Param:  values,
+			Result: new([]*uint64),
+			Test:   func(v any) bool { return reflect.DeepEqual(values, v) },
+		},
 	})
 }
 
@@ -85,6 +259,92 @@ func TestArrayCodecFlatArrayString(t *testing.T) {
 	})
 }
 
+func TestArrayCodecEncodeTextArrayQuotesInternalWhitespace(t *testing.T) {
+	buf, err := pgtype.NewMap().Encode(pgtype.TextArrayOID, pgtype.TextFormatCode, []string{"has space", "two words", "nospaces"}, nil)
+	require.NoError(t, err)
+	require.Equal(t, `{"has space","two words",nospaces}`, string(buf))
+}
+
+func TestArrayCodecDecodeTextBoxArrayUsesBoxDelimiter(t *testing.T) {
+	var boxes []pgtype.Box
+	err := pgtype.NewMap().Scan(pgtype.BoxArrayOID, pgtype.TextFormatCode, []byte(`{(2,2),(1,1);(4,4),(3,3)}`), &boxes)
+	require.NoError(t, err)
+	require.Equal(t, []pgtype.Box{
+		{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+		{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+	}, boxes)
+}
+
+func TestArrayCodecEncodeTextBoxArrayUsesBoxDelimiter(t *testing.T) {
+	buf, err := pgtype.NewMap().Encode(pgtype.BoxArrayOID, pgtype.TextFormatCode, []pgtype.Box{
+		{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+		{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, `{"(2,2),(1,1)";"(4,4),(3,3)"}`, string(buf))
+}
+
+func TestArrayCodecBoxArrayRoundTrip(t *testing.T) {
+	testCases := []struct {
+		input []pgtype.Box
+	}{
+		{nil},
+		{[]pgtype.Box{}},
+		{[]pgtype.Box{
+			{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+		}},
+		{[]pgtype.Box{
+			{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+			{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+		}},
+		{[]pgtype.Box{
+			{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+			{},
+			{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+		}},
+	}
+
+	ctr := defaultConnTestRunner
+	ctr.AfterConnect = func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does not support box type")
+	}
+
+	ctr.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		for i, testCase := range testCases {
+			for _, queryMode := range pgxtest.AllQueryExecModes {
+				var out []pgtype.Box
+				err := conn.QueryRow(ctx, "select $1::box[]", queryMode, testCase.input).Scan(&out)
+				if err != nil {
+					t.Fatalf("i=%d input=%#v queryMode=%s: Scan failed: %s",
+						i, testCase.input, queryMode, err)
+				}
+				if !reflect.DeepEqual(out, testCase.input) {
+					t.Errorf("i=%d input=%#v queryMode=%s: not equal output=%#v",
+						i, testCase.input, queryMode, out)
+				}
+			}
+		}
+
+		// The box delimiter only matters in the text format, so also confirm a
+		// server-produced text box[] scans correctly in the modes that return
+		// text format results.
+		for _, queryMode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeExec} {
+			var out []pgtype.Box
+			err := conn.QueryRow(ctx, "select array['((2,2),(1,1))'::box, '((4,4),(3,3))'::box]", queryMode).Scan(&out)
+			if err != nil {
+				t.Fatalf("queryMode=%s: Scan failed: %s", queryMode, err)
+			}
+			expected := []pgtype.Box{
+				{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+				{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+			}
+			if !reflect.DeepEqual(out, expected) {
+				t.Errorf("queryMode=%s: not equal output=%#v", queryMode, out)
+			}
+		}
+	})
+}
+
 func TestArrayCodecArray(t *testing.T) {
 	ctr := defaultConnTestRunner
 	ctr.AfterConnect = func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
@@ -113,6 +373,44 @@ func TestArrayCodecArray(t *testing.T) {
 			assert.NoErrorf(t, err, "%d", i)
 			assert.Equalf(t, tt.expected, actual, "%d", i)
 		}
+	})
+}
+
+func TestArrayCodecPointerToNil(t *testing.T) {
+	pgxtest.RunWithQueryExecModes(context.Background(), t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		n := int32(42)
+		input := []*int32{&n, nil}
+		var actual []*int32
+		err := conn.QueryRow(
+			ctx,
+			"select $1::int[]",
+			input,
+		).Scan(&actual)
+		require.NoError(t, err)
+		require.Equal(t, input, actual)
+	})
+}
+
+type jsonbValuerSlice []int
+
+func (v jsonbValuerSlice) Value() (driver.Value, error) {
+	if v == nil {
+		return []byte("[]"), nil
+	}
+	return []byte("[1]"), nil
+}
+
+func TestArrayCodecTypedNilElementWithValuer(t *testing.T) {
+	pgxtest.RunWithQueryExecModes(context.Background(), t, defaultConnTestRunner, pgxtest.KnownOIDQueryExecModes, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		input := []jsonbValuerSlice{nil, nil}
+		var actual []string
+		err := conn.QueryRow(
+			ctx,
+			"select $1::jsonb[]::text[]",
+			input,
+		).Scan(&actual)
+		require.NoError(t, err)
+		require.Equal(t, []string{"[]", "[]"}, actual)
 	})
 }
 
@@ -256,7 +554,6 @@ func TestArrayCodecScanMultipleDimensions(t *testing.T) {
 	skipCockroachDB(t, "Server does not support nested arrays (https://github.com/cockroachdb/cockroach/issues/36815)")
 
 	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
-
 		rows, err := conn.Query(ctx, `select '{{1,2,3,4}, {5,6,7,8}, {9,10,11,12}}'::int4[]`)
 		require.NoError(t, err)
 

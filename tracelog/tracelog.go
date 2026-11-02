@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // LogLevel represents the pgx logging level. See LogLevel* constants for
@@ -54,10 +55,10 @@ type Logger interface {
 }
 
 // LoggerFunc is a wrapper around a function to satisfy the pgx.Logger interface
-type LoggerFunc func(ctx context.Context, level LogLevel, msg string, data map[string]interface{})
+type LoggerFunc func(ctx context.Context, level LogLevel, msg string, data map[string]any)
 
 // Log delegates the logging request to the wrapped function
-func (f LoggerFunc) Log(ctx context.Context, level LogLevel, msg string, data map[string]interface{}) {
+func (f LoggerFunc) Log(ctx context.Context, level LogLevel, msg string, data map[string]any) {
 	f(ctx, level, msg, data)
 }
 
@@ -103,7 +104,7 @@ func logQueryArgs(args []any) []any {
 			}
 		case string:
 			if len(v) > 64 {
-				var l int = 0
+				l := 0
 				for w := 0; l < 64; l += w {
 					_, w = utf8.DecodeRuneInString(v[l:])
 				}
@@ -130,8 +131,9 @@ func DefaultTraceLogConfig() *TraceLogConfig {
 	}
 }
 
-// TraceLog implements pgx.QueryTracer, pgx.BatchTracer, pgx.ConnectTracer, and pgx.CopyFromTracer. Logger and LogLevel
-// are required. Config will be automatically initialized on first use if nil.
+// TraceLog implements pgx.QueryTracer, pgx.BatchTracer, pgx.ConnectTracer, pgx.CopyFromTracer, pgxpool.AcquireTracer,
+// and pgxpool.ReleaseTracer. Logger and LogLevel are required. Config will be automatically initialized on the
+// first use if nil.
 type TraceLog struct {
 	Logger   Logger
 	LogLevel LogLevel
@@ -160,6 +162,7 @@ const (
 	tracelogCopyFromCtxKey
 	tracelogConnectCtxKey
 	tracelogPrepareCtxKey
+	tracelogAcquireCtxKey
 )
 
 type traceQueryData struct {
@@ -206,15 +209,24 @@ func (tl *TraceLog) TraceBatchStart(ctx context.Context, conn *pgx.Conn, data pg
 }
 
 func (tl *TraceLog) TraceBatchQuery(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchQueryData) {
+	tl.ensureConfig()
+
+	// ReadStartTime is when pgx began reading this query's result, not when SendBatch was called, so this interval
+	// measures this query's own result consumption rather than its position in the batch.
+	var interval time.Duration
+	if !data.ReadStartTime.IsZero() {
+		interval = time.Since(data.ReadStartTime)
+	}
+
 	if data.Err != nil {
 		if tl.shouldLog(LogLevelError) {
-			tl.log(ctx, conn, LogLevelError, "BatchQuery", map[string]any{"sql": data.SQL, "args": logQueryArgs(data.Args), "err": data.Err})
+			tl.log(ctx, conn, LogLevelError, "BatchQuery", map[string]any{"sql": data.SQL, "args": logQueryArgs(data.Args), "err": data.Err, tl.Config.TimeKey: interval})
 		}
 		return
 	}
 
 	if tl.shouldLog(LogLevelInfo) {
-		tl.log(ctx, conn, LogLevelInfo, "BatchQuery", map[string]any{"sql": data.SQL, "args": logQueryArgs(data.Args), "commandTag": data.CommandTag.String()})
+		tl.log(ctx, conn, LogLevelInfo, "BatchQuery", map[string]any{"sql": data.SQL, "args": logQueryArgs(data.Args), tl.Config.TimeKey: interval, "commandTag": data.CommandTag.String()})
 	}
 }
 
@@ -344,6 +356,44 @@ func (tl *TraceLog) TracePrepareEnd(ctx context.Context, conn *pgx.Conn, data pg
 
 	if tl.shouldLog(LogLevelInfo) {
 		tl.log(ctx, conn, LogLevelInfo, "Prepare", map[string]any{"name": prepareData.name, "sql": prepareData.sql, tl.Config.TimeKey: interval, "alreadyPrepared": data.AlreadyPrepared})
+	}
+}
+
+type traceAcquireData struct {
+	startTime time.Time
+}
+
+func (tl *TraceLog) TraceAcquireStart(ctx context.Context, _ *pgxpool.Pool, _ pgxpool.TraceAcquireStartData) context.Context {
+	return context.WithValue(ctx, tracelogAcquireCtxKey, &traceAcquireData{
+		startTime: time.Now(),
+	})
+}
+
+func (tl *TraceLog) TraceAcquireEnd(ctx context.Context, _ *pgxpool.Pool, data pgxpool.TraceAcquireEndData) {
+	tl.ensureConfig()
+	acquireData := ctx.Value(tracelogAcquireCtxKey).(*traceAcquireData)
+
+	endTime := time.Now()
+	interval := endTime.Sub(acquireData.startTime)
+
+	if data.Err != nil {
+		if tl.shouldLog(LogLevelError) {
+			tl.Logger.Log(ctx, LogLevelError, "Acquire", map[string]any{"err": data.Err, tl.Config.TimeKey: interval})
+		}
+		return
+	}
+
+	if data.Conn != nil {
+		if tl.shouldLog(LogLevelDebug) {
+			tl.log(ctx, data.Conn, LogLevelDebug, "Acquire", map[string]any{tl.Config.TimeKey: interval})
+		}
+	}
+}
+
+func (tl *TraceLog) TraceRelease(_ *pgxpool.Pool, data pgxpool.TraceReleaseData) {
+	if tl.shouldLog(LogLevelDebug) {
+		// there is no context on the TraceRelease callback
+		tl.log(context.Background(), data.Conn, LogLevelDebug, "Release", map[string]any{})
 	}
 }
 

@@ -17,17 +17,17 @@ func TestMultirangeCodecTranscode(t *testing.T) {
 
 	pgxtest.RunValueRoundTripTests(context.Background(), t, defaultConnTestRunner, nil, "int4multirange", []pgxtest.ValueRoundTripTest{
 		{
-			pgtype.Multirange[pgtype.Range[pgtype.Int4]](nil),
-			new(pgtype.Multirange[pgtype.Range[pgtype.Int4]]),
-			func(a any) bool { return reflect.DeepEqual(pgtype.Multirange[pgtype.Range[pgtype.Int4]](nil), a) },
+			Param:  pgtype.Multirange[pgtype.Range[pgtype.Int4]](nil),
+			Result: new(pgtype.Multirange[pgtype.Range[pgtype.Int4]]),
+			Test:   func(a any) bool { return reflect.DeepEqual(pgtype.Multirange[pgtype.Range[pgtype.Int4]](nil), a) },
 		},
 		{
-			pgtype.Multirange[pgtype.Range[pgtype.Int4]]{},
-			new(pgtype.Multirange[pgtype.Range[pgtype.Int4]]),
-			func(a any) bool { return reflect.DeepEqual(pgtype.Multirange[pgtype.Range[pgtype.Int4]]{}, a) },
+			Param:  pgtype.Multirange[pgtype.Range[pgtype.Int4]]{},
+			Result: new(pgtype.Multirange[pgtype.Range[pgtype.Int4]]),
+			Test:   func(a any) bool { return reflect.DeepEqual(pgtype.Multirange[pgtype.Range[pgtype.Int4]]{}, a) },
 		},
 		{
-			pgtype.Multirange[pgtype.Range[pgtype.Int4]]{
+			Param: pgtype.Multirange[pgtype.Range[pgtype.Int4]]{
 				{
 					Lower:     pgtype.Int4{Int32: 1, Valid: true},
 					Upper:     pgtype.Int4{Int32: 5, Valid: true},
@@ -43,8 +43,8 @@ func TestMultirangeCodecTranscode(t *testing.T) {
 					Valid:     true,
 				},
 			},
-			new(pgtype.Multirange[pgtype.Range[pgtype.Int4]]),
-			func(a any) bool {
+			Result: new(pgtype.Multirange[pgtype.Range[pgtype.Int4]]),
+			Test: func(a any) bool {
 				return reflect.DeepEqual(pgtype.Multirange[pgtype.Range[pgtype.Int4]]{
 					{
 						Lower:     pgtype.Int4{Int32: 1, Valid: true},
@@ -71,7 +71,6 @@ func TestMultirangeCodecDecodeValue(t *testing.T) {
 	skipCockroachDB(t, "Server does not support range types (see https://github.com/cockroachdb/cockroach/issues/27791)")
 
 	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, _ testing.TB, conn *pgx.Conn) {
-
 		for _, tt := range []struct {
 			sql      string
 			expected any
@@ -108,6 +107,38 @@ func TestMultirangeCodecDecodeValue(t *testing.T) {
 				}
 
 				require.NoError(t, rows.Err())
+			})
+		}
+	})
+}
+
+func TestMultirangeCodecTextBounds(t *testing.T) {
+	skipPostgreSQLVersionLessThan(t, 14)
+	skipCockroachDB(t, "Server does not support range types")
+
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, _ testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(ctx, `create type pg_temp.text_range as range (subtype = text, collation = "C", multirange_type_name = pg_temp.text_multirange)`)
+		require.NoError(t, err)
+		for _, name := range []string{"pg_temp.text_range", "pg_temp.text_multirange"} {
+			dataType, err := conn.LoadType(ctx, name)
+			require.NoError(t, err)
+			conn.TypeMap().RegisterType(dataType)
+		}
+
+		for _, bound := range []string{"abc", "a,b", "a}b", "a{b", "a)b", "a[b", `a"b`, `a\b`, "", "a b", "a,b}c"} {
+			t.Run(bound, func(t *testing.T) {
+				for _, format := range []int16{pgtype.BinaryFormatCode, pgtype.TextFormatCode} {
+					var got pgtype.Multirange[pgtype.Range[string]]
+					err := conn.QueryRow(ctx,
+						`select pg_temp.text_multirange(pg_temp.text_range($1, 'z', '[)'), pg_temp.text_range('zz', 'zzz' || $1, '[)'))`,
+						pgx.QueryResultFormats{format}, bound).Scan(&got)
+					require.NoError(t, err, "format %d", format)
+					require.Equal(t, pgtype.Multirange[pgtype.Range[string]]{{
+						Lower: bound, Upper: "z", LowerType: pgtype.Inclusive, UpperType: pgtype.Exclusive, Valid: true,
+					}, {
+						Lower: "zz", Upper: "zzz" + bound, LowerType: pgtype.Inclusive, UpperType: pgtype.Exclusive, Valid: true,
+					}}, got, "format %d", format)
+				}
 			})
 		}
 	})

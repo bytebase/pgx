@@ -19,7 +19,7 @@ import (
 )
 
 func BenchmarkConnectClose(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		conn, err := pgx.Connect(context.Background(), os.Getenv("PGX_TEST_DATABASE"))
 		if err != nil {
 			b.Fatal(err)
@@ -43,8 +43,7 @@ func BenchmarkMinimalUnpreparedSelectWithoutStatementCache(b *testing.B) {
 
 	var n int64
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		err := conn.QueryRow(context.Background(), "select $1::int8", i).Scan(&n)
 		if err != nil {
 			b.Fatal(err)
@@ -67,8 +66,7 @@ func BenchmarkMinimalUnpreparedSelectWithStatementCacheModeDescribe(b *testing.B
 
 	var n int64
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		err := conn.QueryRow(context.Background(), "select $1::int8", i).Scan(&n)
 		if err != nil {
 			b.Fatal(err)
@@ -91,8 +89,7 @@ func BenchmarkMinimalUnpreparedSelectWithStatementCacheModePrepare(b *testing.B)
 
 	var n int64
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		err := conn.QueryRow(context.Background(), "select $1::int8", i).Scan(&n)
 		if err != nil {
 			b.Fatal(err)
@@ -115,8 +112,7 @@ func BenchmarkMinimalPreparedSelect(b *testing.B) {
 
 	var n int64
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		err = conn.QueryRow(context.Background(), "ps1", i).Scan(&n)
 		if err != nil {
 			b.Fatal(err)
@@ -141,10 +137,44 @@ func BenchmarkMinimalPgConnPreparedSelect(b *testing.B) {
 
 	encodedBytes := make([]byte, 8)
 
+	for b.Loop() {
+
+		rr := pgConn.ExecPrepared(context.Background(), "ps1", [][]byte{encodedBytes}, []int16{1}, []int16{1})
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		for rr.NextRow() {
+			for i := range rr.Values() {
+				if !bytes.Equal(rr.Values()[0], encodedBytes) {
+					b.Fatalf("unexpected values: %s %s", rr.Values()[i], encodedBytes)
+				}
+			}
+		}
+		_, err = rr.Close()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMinimalPgConnPreparedStatementDescriptionSelect(b *testing.B) {
+	conn := mustConnect(b, mustParseConfig(b, os.Getenv("PGX_TEST_DATABASE")))
+	defer closeConn(b, conn)
+
+	pgConn := conn.PgConn()
+
+	psd, err := pgConn.Prepare(context.Background(), "ps1", "select $1::int8", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	encodedBytes := make([]byte, 8)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 
-		rr := pgConn.ExecPrepared(context.Background(), "ps1", [][]byte{encodedBytes}, []int16{1}, []int16{1})
+		rr := pgConn.ExecStatement(context.Background(), psd, [][]byte{encodedBytes}, []int16{1}, []int16{1})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -172,8 +202,7 @@ func BenchmarkPointerPointerWithNullValues(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		var record struct {
 			id            int32
 			userName      string
@@ -232,8 +261,7 @@ func BenchmarkPointerPointerWithPresentValues(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		var record struct {
 			id            int32
 			userName      string
@@ -383,9 +411,7 @@ func benchmarkWriteNRowsViaInsert(b *testing.B, n int) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		src := newBenchmarkWriteTableCopyFromSrc(n)
 
 		tx, err := conn.Begin(context.Background())
@@ -417,9 +443,7 @@ func benchmarkWriteNRowsViaBatchInsert(b *testing.B, n int) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		src := newBenchmarkWriteTableCopyFromSrc(n)
 
 		batch := &pgx.Batch{}
@@ -516,7 +540,6 @@ func multiInsert(conn *pgx.Conn, tableName string, columnNames []string, rowSrc 
 	}
 
 	return rowCount, nil
-
 }
 
 func benchmarkWriteNRowsViaMultiInsert(b *testing.B, n int) {
@@ -529,13 +552,12 @@ func benchmarkWriteNRowsViaMultiInsert(b *testing.B, n int) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		src := newBenchmarkWriteTableCopyFromSrc(n)
 
 		_, err := multiInsert(conn, "t",
-			[]string{"varchar_1",
+			[]string{
+				"varchar_1",
 				"varchar_2",
 				"varchar_null_1",
 				"date_1",
@@ -547,7 +569,8 @@ func benchmarkWriteNRowsViaMultiInsert(b *testing.B, n int) {
 				"tstz_2",
 				"bool_1",
 				"bool_2",
-				"bool_3"},
+				"bool_3",
+			},
 			src)
 		if err != nil {
 			b.Fatal(err)
@@ -561,14 +584,13 @@ func benchmarkWriteNRowsViaCopy(b *testing.B, n int) {
 
 	mustExec(b, conn, benchmarkWriteTableCreateSQL)
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		src := newBenchmarkWriteTableCopyFromSrc(n)
 
 		_, err := conn.CopyFrom(context.Background(),
 			pgx.Identifier{"t"},
-			[]string{"varchar_1",
+			[]string{
+				"varchar_1",
 				"varchar_2",
 				"varchar_null_1",
 				"date_1",
@@ -580,7 +602,8 @@ func benchmarkWriteNRowsViaCopy(b *testing.B, n int) {
 				"tstz_2",
 				"bool_1",
 				"bool_2",
-				"bool_3"},
+				"bool_3",
+			},
 			src)
 		if err != nil {
 			b.Fatal(err)
@@ -611,6 +634,7 @@ func BenchmarkWrite5RowsViaInsert(b *testing.B) {
 func BenchmarkWrite5RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 5)
 }
+
 func BenchmarkWrite5RowsViaBatchInsert(b *testing.B) {
 	benchmarkWriteNRowsViaBatchInsert(b, 5)
 }
@@ -626,6 +650,7 @@ func BenchmarkWrite10RowsViaInsert(b *testing.B) {
 func BenchmarkWrite10RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 10)
 }
+
 func BenchmarkWrite10RowsViaBatchInsert(b *testing.B) {
 	benchmarkWriteNRowsViaBatchInsert(b, 10)
 }
@@ -641,6 +666,7 @@ func BenchmarkWrite100RowsViaInsert(b *testing.B) {
 func BenchmarkWrite100RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 100)
 }
+
 func BenchmarkWrite100RowsViaBatchInsert(b *testing.B) {
 	benchmarkWriteNRowsViaBatchInsert(b, 100)
 }
@@ -650,34 +676,35 @@ func BenchmarkWrite100RowsViaCopy(b *testing.B) {
 }
 
 func BenchmarkWrite1000RowsViaInsert(b *testing.B) {
-	benchmarkWriteNRowsViaInsert(b, 1000)
+	benchmarkWriteNRowsViaInsert(b, 1_000)
 }
 
 func BenchmarkWrite1000RowsViaMultiInsert(b *testing.B) {
-	benchmarkWriteNRowsViaMultiInsert(b, 1000)
+	benchmarkWriteNRowsViaMultiInsert(b, 1_000)
 }
 
 func BenchmarkWrite1000RowsViaBatchInsert(b *testing.B) {
-	benchmarkWriteNRowsViaBatchInsert(b, 1000)
+	benchmarkWriteNRowsViaBatchInsert(b, 1_000)
 }
 
 func BenchmarkWrite1000RowsViaCopy(b *testing.B) {
-	benchmarkWriteNRowsViaCopy(b, 1000)
+	benchmarkWriteNRowsViaCopy(b, 1_000)
 }
 
 func BenchmarkWrite10000RowsViaInsert(b *testing.B) {
-	benchmarkWriteNRowsViaInsert(b, 10000)
+	benchmarkWriteNRowsViaInsert(b, 10_000)
 }
 
 func BenchmarkWrite10000RowsViaMultiInsert(b *testing.B) {
-	benchmarkWriteNRowsViaMultiInsert(b, 10000)
+	benchmarkWriteNRowsViaMultiInsert(b, 10_000)
 }
+
 func BenchmarkWrite10000RowsViaBatchInsert(b *testing.B) {
-	benchmarkWriteNRowsViaBatchInsert(b, 10000)
+	benchmarkWriteNRowsViaBatchInsert(b, 10_000)
 }
 
 func BenchmarkWrite10000RowsViaCopy(b *testing.B) {
-	benchmarkWriteNRowsViaCopy(b, 10000)
+	benchmarkWriteNRowsViaCopy(b, 10_000)
 }
 
 func BenchmarkMultipleQueriesNonBatchNoStatementCache(b *testing.B) {
@@ -717,9 +744,8 @@ func BenchmarkMultipleQueriesNonBatchDescribeStatementCache(b *testing.B) {
 }
 
 func benchmarkMultipleQueriesNonBatch(b *testing.B, conn *pgx.Conn, queryCount int) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for j := 0; j < queryCount; j++ {
+	for b.Loop() {
+		for range queryCount {
 			rows, err := conn.Query(context.Background(), "select n from generate_series(0, 5) n")
 			if err != nil {
 				b.Fatal(err)
@@ -779,16 +805,15 @@ func BenchmarkMultipleQueriesBatchDescribeStatementCache(b *testing.B) {
 }
 
 func benchmarkMultipleQueriesBatch(b *testing.B, conn *pgx.Conn, queryCount int) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		batch := &pgx.Batch{}
-		for j := 0; j < queryCount; j++ {
+		for range queryCount {
 			batch.Queue("select n from generate_series(0,5) n")
 		}
 
 		br := conn.SendBatch(context.Background(), batch)
 
-		for j := 0; j < queryCount; j++ {
+		for range queryCount {
 			rows, err := br.Query()
 			if err != nil {
 				b.Fatal(err)
@@ -831,9 +856,8 @@ func BenchmarkSelectManyUnknownEnum(b *testing.B) {
 	_, err = tx.Exec(ctx, `create type color as enum ('blue', 'green', 'orange')`)
 	require.NoError(b, err)
 
-	b.ResetTimer()
 	var x, y, z string
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rows, err := conn.Query(ctx, "select 'blue'::color, 'green'::color, 'orange'::color from generate_series(1,10)")
 		if err != nil {
 			b.Fatal(err)
@@ -883,9 +907,8 @@ func BenchmarkSelectManyRegisteredEnum(b *testing.B) {
 
 	conn.TypeMap().RegisterType(&pgtype.Type{Name: "color", OID: oid, Codec: &pgtype.EnumCodec{}})
 
-	b.ResetTimer()
 	var x, y, z string
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rows, err := conn.Query(ctx, "select 'blue'::color, 'green'::color, 'orange'::color from generate_series(1,10)")
 		if err != nil {
 			b.Fatal(err)
@@ -919,7 +942,7 @@ func getSelectRowsCounts(b *testing.B) []int64 {
 	{
 		s := os.Getenv("PGX_BENCH_SELECT_ROWS_COUNTS")
 		if s != "" {
-			for _, p := range strings.Split(s, " ") {
+			for p := range strings.SplitSeq(s, " ") {
 				n, err := strconv.ParseInt(p, 10, 64)
 				if err != nil {
 					b.Fatalf("Bad PGX_BENCH_SELECT_ROWS_COUNTS value: %v", err)
@@ -944,6 +967,7 @@ type BenchRowSimple struct {
 	BirthDate  time.Time
 	Weight     int32
 	Height     int32
+	Tags       []string
 	UpdateTime time.Time
 }
 
@@ -956,14 +980,14 @@ func BenchmarkSelectRowsScanSimple(b *testing.B) {
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
 			br := &BenchRowSimple{}
-			for i := 0; i < b.N; i++ {
-				rows, err := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
+			for b.Loop() {
+				rows, err := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
 				if err != nil {
 					b.Fatal(err)
 				}
 
 				for rows.Next() {
-					rows.Scan(&br.ID, &br.FirstName, &br.LastName, &br.Sex, &br.BirthDate, &br.Weight, &br.Height, &br.UpdateTime)
+					rows.Scan(&br.ID, &br.FirstName, &br.LastName, &br.Sex, &br.BirthDate, &br.Weight, &br.Height, &br.Tags, &br.UpdateTime)
 				}
 
 				if rows.Err() != nil {
@@ -982,6 +1006,7 @@ type BenchRowStringBytes struct {
 	BirthDate  time.Time
 	Weight     int32
 	Height     int32
+	Tags       []string
 	UpdateTime time.Time
 }
 
@@ -994,14 +1019,14 @@ func BenchmarkSelectRowsScanStringBytes(b *testing.B) {
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
 			br := &BenchRowStringBytes{}
-			for i := 0; i < b.N; i++ {
-				rows, err := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
+			for b.Loop() {
+				rows, err := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
 				if err != nil {
 					b.Fatal(err)
 				}
 
 				for rows.Next() {
-					rows.Scan(&br.ID, &br.FirstName, &br.LastName, &br.Sex, &br.BirthDate, &br.Weight, &br.Height, &br.UpdateTime)
+					rows.Scan(&br.ID, &br.FirstName, &br.LastName, &br.Sex, &br.BirthDate, &br.Weight, &br.Height, &br.Tags, &br.UpdateTime)
 				}
 
 				if rows.Err() != nil {
@@ -1020,6 +1045,7 @@ type BenchRowDecoder struct {
 	BirthDate  pgtype.Date
 	Weight     pgtype.Int4
 	Height     pgtype.Int4
+	Tags       pgtype.FlatArray[string]
 	UpdateTime pgtype.Timestamptz
 }
 
@@ -1040,12 +1066,11 @@ func BenchmarkSelectRowsScanDecoder(b *testing.B) {
 			}
 			for _, format := range formats {
 				b.Run(format.name, func(b *testing.B) {
-
 					br := &BenchRowDecoder{}
-					for i := 0; i < b.N; i++ {
+					for b.Loop() {
 						rows, err := conn.Query(
 							context.Background(),
-							"select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n",
+							"select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n",
 							pgx.QueryResultFormats{format.code},
 							rowCount,
 						)
@@ -1054,7 +1079,7 @@ func BenchmarkSelectRowsScanDecoder(b *testing.B) {
 						}
 
 						for rows.Next() {
-							rows.Scan(&br.ID, &br.FirstName, &br.LastName, &br.Sex, &br.BirthDate, &br.Weight, &br.Height, &br.UpdateTime)
+							rows.Scan(&br.ID, &br.FirstName, &br.LastName, &br.Sex, &br.BirthDate, &br.Weight, &br.Height, &br.Tags, &br.UpdateTime)
 						}
 
 						if rows.Err() != nil {
@@ -1075,8 +1100,8 @@ func BenchmarkSelectRowsPgConnExecText(b *testing.B) {
 
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				mrr := conn.PgConn().Exec(context.Background(), fmt.Sprintf("select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + %d) n", rowCount))
+			for b.Loop() {
+				mrr := conn.PgConn().Exec(context.Background(), fmt.Sprintf("select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + %d) n", rowCount))
 				for mrr.NextResult() {
 					rr := mrr.ResultReader()
 					for rr.NextRow() {
@@ -1110,14 +1135,14 @@ func BenchmarkSelectRowsPgConnExecParams(b *testing.B) {
 			}
 			for _, format := range formats {
 				b.Run(format.name, func(b *testing.B) {
-					for i := 0; i < b.N; i++ {
+					for b.Loop() {
 						rr := conn.PgConn().ExecParams(
 							context.Background(),
-							"select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n",
+							"select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n",
 							[][]byte{[]byte(strconv.FormatInt(rowCount, 10))},
 							nil,
 							nil,
-							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code},
+							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code, format.code},
 						)
 						for rr.NextRow() {
 							rr.Values()
@@ -1142,8 +1167,8 @@ func BenchmarkSelectRowsSimpleCollectRowsRowToStructByPos(b *testing.B) {
 
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				rows, _ := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
+			for b.Loop() {
+				rows, _ := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
 				benchRows, err := pgx.CollectRows(rows, pgx.RowToStructByPos[BenchRowSimple])
 				if err != nil {
 					b.Fatal(err)
@@ -1165,9 +1190,9 @@ func BenchmarkSelectRowsSimpleAppendRowsRowToStructByPos(b *testing.B) {
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
 			benchRows := make([]BenchRowSimple, 0, rowCount)
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				benchRows = benchRows[:0]
-				rows, _ := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
+				rows, _ := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
 				var err error
 				benchRows, err = pgx.AppendRows(benchRows, rows, pgx.RowToStructByPos[BenchRowSimple])
 				if err != nil {
@@ -1189,8 +1214,8 @@ func BenchmarkSelectRowsSimpleCollectRowsRowToStructByName(b *testing.B) {
 
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				rows, _ := conn.Query(context.Background(), "select n as id, 'Adam' as first_name, 'Smith ' || n as last_name, 'male' as sex, '1952-06-16'::date as birth_date, 258 as weight, 72 as height, '2001-01-28 01:02:03-05'::timestamptz as update_time from generate_series(100001, 100000 + $1) n", rowCount)
+			for b.Loop() {
+				rows, _ := conn.Query(context.Background(), "select n as id, 'Adam' as first_name, 'Smith ' || n as last_name, 'male' as sex, '1952-06-16'::date as birth_date, 258 as weight, 72 as height, '{foo,bar,baz}'::text[] as tags, '2001-01-28 01:02:03-05'::timestamptz as update_time from generate_series(100001, 100000 + $1) n", rowCount)
 				benchRows, err := pgx.CollectRows(rows, pgx.RowToStructByName[BenchRowSimple])
 				if err != nil {
 					b.Fatal(err)
@@ -1212,9 +1237,9 @@ func BenchmarkSelectRowsSimpleAppendRowsRowToStructByName(b *testing.B) {
 	for _, rowCount := range rowCounts {
 		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
 			benchRows := make([]BenchRowSimple, 0, rowCount)
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				benchRows = benchRows[:0]
-				rows, _ := conn.Query(context.Background(), "select n as id, 'Adam' as first_name, 'Smith ' || n as last_name, 'male' as sex, '1952-06-16'::date as birth_date, 258 as weight, 72 as height, '2001-01-28 01:02:03-05'::timestamptz as update_time from generate_series(100001, 100000 + $1) n", rowCount)
+				rows, _ := conn.Query(context.Background(), "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", rowCount)
 				var err error
 				benchRows, err = pgx.AppendRows(benchRows, rows, pgx.RowToStructByPos[BenchRowSimple])
 				if err != nil {
@@ -1234,7 +1259,52 @@ func BenchmarkSelectRowsPgConnExecPrepared(b *testing.B) {
 
 	rowCounts := getSelectRowsCounts(b)
 
-	_, err := conn.PgConn().Prepare(context.Background(), "ps1", "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", nil)
+	_, err := conn.PgConn().Prepare(context.Background(), "ps1", "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for _, rowCount := range rowCounts {
+		b.Run(fmt.Sprintf("%d rows", rowCount), func(b *testing.B) {
+			formats := []struct {
+				name string
+				code int16
+			}{
+				{"text", pgx.TextFormatCode},
+				{"binary - mostly", pgx.BinaryFormatCode},
+			}
+			for _, format := range formats {
+				b.Run(format.name, func(b *testing.B) {
+					for b.Loop() {
+						rr := conn.PgConn().ExecPrepared(
+							context.Background(),
+							"ps1",
+							[][]byte{[]byte(strconv.FormatInt(rowCount, 10))},
+							nil,
+							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code, format.code},
+						)
+						for rr.NextRow() {
+							rr.Values()
+						}
+
+						_, err := rr.Close()
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkSelectRowsPgConnExecStatement(b *testing.B) {
+	conn := mustConnectString(b, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(b, conn)
+
+	rowCounts := getSelectRowsCounts(b)
+
+	psd, err := conn.PgConn().Prepare(context.Background(), "ps1", "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1251,12 +1321,12 @@ func BenchmarkSelectRowsPgConnExecPrepared(b *testing.B) {
 			for _, format := range formats {
 				b.Run(format.name, func(b *testing.B) {
 					for i := 0; i < b.N; i++ {
-						rr := conn.PgConn().ExecPrepared(
+						rr := conn.PgConn().ExecStatement(
 							context.Background(),
-							"ps1",
+							psd,
 							[][]byte{[]byte(strconv.FormatInt(rowCount, 10))},
 							nil,
-							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code},
+							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code, format.code},
 						)
 						for rr.NextRow() {
 							rr.Values()
@@ -1335,7 +1405,7 @@ func BenchmarkSelectRowsRawPrepared(b *testing.B) {
 					conn := mustConnectString(b, os.Getenv("PGX_TEST_DATABASE")).PgConn()
 					defer conn.Close(context.Background())
 
-					_, err := conn.Prepare(context.Background(), "ps1", "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", nil)
+					_, err := conn.Prepare(context.Background(), "ps1", "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", nil)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -1358,7 +1428,7 @@ func BenchmarkSelectRowsRawPrepared(b *testing.B) {
 							"ps1",
 							[][]byte{[]byte(strconv.FormatInt(rowCount, 10))},
 							nil,
-							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code},
+							[]int16{format.code, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, format.code, format.code, format.code, format.code, format.code},
 						)
 						_, err := rr.Close()
 						require.NoError(b, err)
@@ -1367,7 +1437,7 @@ func BenchmarkSelectRowsRawPrepared(b *testing.B) {
 					buf := make([]byte, qr.readCount)
 
 					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
+					for b.Loop() {
 						_, err := qr.conn.Write(qr.writeBuf)
 						if err != nil {
 							b.Fatal(err)
