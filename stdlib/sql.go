@@ -852,16 +852,6 @@ func (r *Rows) initValueFuncs() {
 					if err != nil {
 						return nil, err
 					}
-
-					if d.InfinityModifier == pgtype.Finite {
-						timezone := r.conn.conn.PgConn().ParameterStatus("TimeZone")
-						lc, err := time.LoadLocation(timezone)
-						if err != nil {
-							return nil, err
-						}
-						d.Time = d.Time.In(lc)
-					}
-
 					return d.Value()
 				}
 			case pgtype.XMLOID:
